@@ -502,7 +502,8 @@ for block in model.blocks:
         muon_vars_by_shape[shape].append(linear.kernel)
 
 # Flatten params to get leaf ordering, build id->index map
-param_leaves, param_treedef = jax.tree.flatten(params)
+param_leaves_list, param_treedef = jax.tree.flatten(params)
+param_leaves = tuple(param_leaves_list)
 leaf_id_to_idx = {id(leaf): i for i, leaf in enumerate(param_leaves)}
 
 # For each leaf, determine: 'adamw' or 'muon', plus group-specific config
@@ -548,13 +549,13 @@ for indices, is_tall, lr_scale, shape in muon_group_info:
     else:
         muon_second_momentum_bufs.append(jnp.zeros((n, shape[0], 1), dtype=jnp.float32))
 
-# Pack optimizer state into a pytree for JIT
+# Pack optimizer state into a pytree for JIT (use tuples for immutable structure)
 opt_state = {
-    'adamw_ea': adamw_exp_avg,
-    'adamw_eas': adamw_exp_avg_sq,
-    'adamw_steps': adamw_step_counts,
-    'muon_mb': muon_momentum_bufs,
-    'muon_smb': muon_second_momentum_bufs,
+    'adamw_ea': tuple(adamw_exp_avg),
+    'adamw_eas': tuple(adamw_exp_avg_sq),
+    'adamw_steps': tuple(adamw_step_counts),
+    'muon_mb': tuple(muon_momentum_bufs),
+    'muon_smb': tuple(muon_second_momentum_bufs),
 }
 
 train_loader = make_dataloader(tokenizer, total_device_batch, MAX_SEQ_LEN, "train")
@@ -601,48 +602,56 @@ def eval_forward(params, rest, x, y):
     mdl = nnx.merge(graphdef, params, rest)
     return mdl(x, y, reduction='none')
 
-def apply_optimizer(param_leaves, grad_leaves, opt_state, lrm, muon_momentum, muon_wd):
-    """Apply AdamW and Muon updates. Runs in Python but ops dispatch to TPU."""
-    new_params = list(param_leaves)
+@jax.jit
+def apply_optimizer(param_tuple, grad_tuple, opt_state, lrm, muon_momentum, muon_wd):
+    """Apply AdamW and Muon updates. Fully JIT-compiled.
+    param_tuple and grad_tuple are tuples of arrays (flattened params/grads).
+    Loops over static Python indices unroll at trace time."""
+    # Start with a mutable mapping of idx -> updated_param
+    updates = {}
 
     # --- AdamW updates ---
-    new_ea = list(opt_state['adamw_ea'])
-    new_eas = list(opt_state['adamw_eas'])
-    new_steps = list(opt_state['adamw_steps'])
+    new_ea = []
+    new_eas = []
+    new_steps = []
     for i, (idx, base_lr, beta1, beta2, eps, wd) in enumerate(adamw_leaf_indices):
         lr = base_lr * lrm
         p, ea, eas, sc = adamw_update(
-            new_params[idx], grad_leaves[idx],
-            new_ea[i], new_eas[i], new_steps[i],
+            param_tuple[idx], grad_tuple[idx],
+            opt_state['adamw_ea'][i], opt_state['adamw_eas'][i], opt_state['adamw_steps'][i],
             lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd,
         )
-        new_params[idx] = p
-        new_ea[i] = ea
-        new_eas[i] = eas
-        new_steps[i] = sc
+        updates[idx] = p
+        new_ea.append(ea)
+        new_eas.append(eas)
+        new_steps.append(sc)
 
     # --- Muon updates ---
-    new_mb = list(opt_state['muon_mb'])
-    new_smb = list(opt_state['muon_smb'])
+    new_mb = []
+    new_smb = []
     for gi, (indices, is_tall, lr_scale, shape) in enumerate(muon_group_info):
         lr_scaled = MATRIX_LR * lrm * lr_scale
-        stacked_p = jnp.stack([new_params[j] for j in indices])
-        stacked_g = jnp.stack([grad_leaves[j] for j in indices])
+        # Use updates dict if param was already modified (shouldn't happen for Muon, but safe)
+        stacked_p = jnp.stack([updates.get(j, param_tuple[j]) for j in indices])
+        stacked_g = jnp.stack([grad_tuple[j] for j in indices])
         up, mb, smb = muon_update(
-            stacked_p, stacked_g, new_mb[gi], new_smb[gi],
+            stacked_p, stacked_g, opt_state['muon_mb'][gi], opt_state['muon_smb'][gi],
             momentum=muon_momentum, lr=lr_scaled, wd=muon_wd,
             beta2=0.95, is_tall=is_tall,
         )
-        new_mb[gi] = mb
-        new_smb[gi] = smb
+        new_mb.append(mb)
+        new_smb.append(smb)
         for k, j in enumerate(indices):
-            new_params[j] = up[k]
+            updates[j] = up[k]
+
+    # Build output tuple: use updated value if exists, else original
+    out_params = tuple(updates.get(i, param_tuple[i]) for i in range(len(param_tuple)))
 
     new_opt_state = {
         'adamw_ea': new_ea, 'adamw_eas': new_eas, 'adamw_steps': new_steps,
         'muon_mb': new_mb, 'muon_smb': new_smb,
     }
-    return new_params, new_opt_state
+    return out_params, new_opt_state
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -676,7 +685,7 @@ while True:
         total_loss += float(loss) / grad_accum_steps
 
     # Flatten grads to match param_leaves ordering
-    grad_leaves = jax.tree.leaves(accumulated_grads)
+    grad_leaves = tuple(jax.tree.leaves(accumulated_grads))
 
     # Compute schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -684,14 +693,14 @@ while True:
     muon_momentum = get_muon_momentum(step)
     muon_wd = get_weight_decay(progress)
 
-    # Apply optimizer (dispatches to TPU, Python overhead is just loop + dispatch)
+    # Apply optimizer (fully JIT-compiled)
     new_param_leaves, opt_state = apply_optimizer(
         param_leaves, grad_leaves, opt_state, lrm, muon_momentum, muon_wd
     )
 
     # Rebuild params pytree from updated leaves
-    params = jax.tree.unflatten(param_treedef, new_param_leaves)
     param_leaves = new_param_leaves
+    params = jax.tree.unflatten(param_treedef, param_leaves)
 
     train_loss_f = total_loss
 
