@@ -392,55 +392,6 @@ def adamw_update(param_val, grad, exp_avg, exp_avg_sq, step_count, lr, beta1, be
 
 
 # ---------------------------------------------------------------------------
-# Parameter group management
-# ---------------------------------------------------------------------------
-
-def build_param_registry(model, config):
-    """
-    Build a registry mapping each trainable parameter to its optimizer group.
-    Returns:
-        param_id_to_group: dict mapping id(param_variable) -> group_info
-        muon_shape_groups: dict mapping shape -> list of param_variables
-    """
-    dmodel_lr_scale = (config.n_embd / 768) ** -0.5
-
-    # Each entry: (nnx_variable, group_name, extra_config)
-    param_id_to_group = {}
-
-    # AdamW groups
-    adamw_config = {
-        'lm_head': dict(base_lr=0.004 * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, wd=0.0),
-        'embed': dict(base_lr=0.6 * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, wd=0.0),
-        'resid_scalar': dict(base_lr=0.5 * 0.01, betas=(0.8, 0.95), eps=1e-10, wd=0.0),
-        'x0_scalar': dict(base_lr=0.5, betas=(0.96, 0.95), eps=1e-10, wd=0.0),
-    }
-
-    param_id_to_group[id(model.lm_head.kernel)] = ('lm_head', model.lm_head.kernel)
-    param_id_to_group[id(model.wte.embedding)] = ('embed', model.wte.embedding)
-    for k in model.value_embeds:
-        param_id_to_group[id(model.value_embeds[k].embedding)] = ('embed', model.value_embeds[k].embedding)
-    param_id_to_group[id(model.resid_lambdas)] = ('resid_scalar', model.resid_lambdas)
-    param_id_to_group[id(model.x0_lambdas)] = ('x0_scalar', model.x0_lambdas)
-
-    # VE gate weights -> resid_scalar group (small params, AdamW)
-    for block in model.blocks:
-        if block.attn.has_ve:
-            param_id_to_group[id(block.attn.ve_gate.kernel)] = ('resid_scalar', block.attn.ve_gate.kernel)
-
-    # Muon groups keyed by shape
-    muon_shape_groups = {}
-    for block in model.blocks:
-        for linear in [block.attn.c_q, block.attn.c_k, block.attn.c_v,
-                       block.attn.c_proj, block.mlp.c_fc, block.mlp.c_proj]:
-            shape = linear.kernel.value.shape
-            if shape not in muon_shape_groups:
-                muon_shape_groups[shape] = []
-            muon_shape_groups[shape].append(linear.kernel)
-
-    return param_id_to_group, muon_shape_groups, adamw_config
-
-
-# ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
@@ -522,40 +473,89 @@ assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0, \
     f"TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be divisible by tokens_per_fwdbwd ({tokens_per_fwdbwd})"
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-# Build parameter registry
-param_id_to_group, muon_shape_groups, adamw_config = build_param_registry(model, config)
+# ---------------------------------------------------------------------------
+# Optimizer setup: build flat index maps for JIT-friendly optimizer
+# ---------------------------------------------------------------------------
+
+# Split model into graphdef (static structure), params (trainable), rest (buffers)
+graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+
+# Build index maps: for each param leaf, record which optimizer group it belongs to
+# and for Muon params, which shape group and position within that group.
 dmodel_lr_scale = (config.n_embd / 768) ** -0.5
 print(f"Scaling AdamW LRs by 1/sqrt({config.n_embd}/768) = {dmodel_lr_scale:.6f}")
 
-# Initialize optimizer states
-# AdamW states: keyed by id(variable)
-adamw_states = {}
-for pid, (group_name, var) in param_id_to_group.items():
-    adamw_states[pid] = {
-        'exp_avg': jnp.zeros_like(var.value),
-        'exp_avg_sq': jnp.zeros_like(var.value),
-        'step': 0,
-    }
+# Collect NNX variables by group (before flattening)
+adamw_vars = {}  # group_name -> list of nnx.Param variables
+adamw_vars['lm_head'] = [model.lm_head.kernel]
+adamw_vars['embed'] = [model.wte.embedding] + [model.value_embeds[k].embedding for k in model.value_embeds]
+adamw_vars['resid_scalar'] = [model.resid_lambdas] + [block.attn.ve_gate.kernel for block in model.blocks if block.attn.has_ve]
+adamw_vars['x0_scalar'] = [model.x0_lambdas]
 
-# Muon states: keyed by shape tuple
-muon_states = {}
-for shape, params_list in muon_shape_groups.items():
-    n = len(params_list)
-    stacked_shape = (n,) + shape
-    # Flax kernel shape is (in, out) — PyTorch is (out, in).
-    # "tall" in the Muon sense means out_features >= in_features,
-    # which is shape[-1] >= shape[-2] in Flax convention.
+muon_vars_by_shape = {}  # shape -> list of nnx.Param variables
+for block in model.blocks:
+    for linear in [block.attn.c_q, block.attn.c_k, block.attn.c_v,
+                   block.attn.c_proj, block.mlp.c_fc, block.mlp.c_proj]:
+        shape = linear.kernel.value.shape
+        if shape not in muon_vars_by_shape:
+            muon_vars_by_shape[shape] = []
+        muon_vars_by_shape[shape].append(linear.kernel)
+
+# Flatten params to get leaf ordering, build id->index map
+param_leaves, param_treedef = jax.tree.flatten(params)
+leaf_id_to_idx = {id(leaf): i for i, leaf in enumerate(param_leaves)}
+
+# For each leaf, determine: 'adamw' or 'muon', plus group-specific config
+# We store this as static arrays that can be used inside JIT
+num_leaves = len(param_leaves)
+
+# AdamW config per leaf: (base_lr, beta1, beta2, eps, wd) — only for adamw leaves
+adamw_group_configs = {
+    'lm_head': (UNEMBEDDING_LR * dmodel_lr_scale, 0.8, 0.95, 1e-10, 0.0),
+    'embed': (EMBEDDING_LR * dmodel_lr_scale, 0.8, 0.95, 1e-10, 0.0),
+    'resid_scalar': (SCALAR_LR * 0.01, 0.8, 0.95, 1e-10, 0.0),
+    'x0_scalar': (SCALAR_LR, 0.96, 0.95, 1e-10, 0.0),
+}
+
+# Build per-leaf AdamW config arrays
+adamw_leaf_indices = []  # list of (leaf_idx, base_lr, beta1, beta2, eps, wd)
+for group_name, vars_list in adamw_vars.items():
+    cfg = adamw_group_configs[group_name]
+    for var in vars_list:
+        idx = leaf_id_to_idx[id(var.value)]
+        adamw_leaf_indices.append((idx, *cfg))
+
+# Build Muon shape group info
+muon_group_info = []  # list of (leaf_indices, is_tall, lr_scale)
+for shape, vars_list in muon_vars_by_shape.items():
+    indices = [leaf_id_to_idx[id(var.value)] for var in vars_list]
     is_tall = shape[-1] >= shape[-2]
+    lr_scale = max(1.0, shape[-1] / shape[-2]) ** 0.5
+    muon_group_info.append((indices, is_tall, lr_scale, shape))
+
+# Initialize optimizer state as flat arrays matching param_leaves
+adamw_exp_avg = [jnp.zeros_like(param_leaves[idx]) for idx, *_ in adamw_leaf_indices]
+adamw_exp_avg_sq = [jnp.zeros_like(param_leaves[idx]) for idx, *_ in adamw_leaf_indices]
+adamw_step_counts = [jnp.array(0, dtype=jnp.int32) for _ in adamw_leaf_indices]
+
+muon_momentum_bufs = []
+muon_second_momentum_bufs = []
+for indices, is_tall, lr_scale, shape in muon_group_info:
+    n = len(indices)
+    muon_momentum_bufs.append(jnp.zeros((n,) + shape, dtype=jnp.float32))
     if is_tall:
-        # reduce along in dim (axis -2 in Flax (in, out)) -> smb_shape = (N, 1, out)
-        smb_shape_tuple = (n, 1, shape[1])
+        muon_second_momentum_bufs.append(jnp.zeros((n, 1, shape[1]), dtype=jnp.float32))
     else:
-        # reduce along out dim (axis -1 in Flax (in, out)) -> smb_shape = (N, in, 1)
-        smb_shape_tuple = (n, shape[0], 1)
-    muon_states[shape] = {
-        'momentum_buffer': jnp.zeros(stacked_shape, dtype=jnp.float32),
-        'second_momentum_buffer': jnp.zeros(smb_shape_tuple, dtype=jnp.float32),
-    }
+        muon_second_momentum_bufs.append(jnp.zeros((n, shape[0], 1), dtype=jnp.float32))
+
+# Pack optimizer state into a pytree for JIT
+opt_state = {
+    'adamw_ea': adamw_exp_avg,
+    'adamw_eas': adamw_exp_avg_sq,
+    'adamw_steps': adamw_step_counts,
+    'muon_mb': muon_momentum_bufs,
+    'muon_smb': muon_second_momentum_bufs,
+}
 
 train_loader = make_dataloader(tokenizer, total_device_batch, MAX_SEQ_LEN, "train")
 
@@ -582,11 +582,8 @@ def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
 
 # ---------------------------------------------------------------------------
-# JIT-compiled forward/backward
+# JIT-compiled forward/backward + optimizer step
 # ---------------------------------------------------------------------------
-
-# Split model into: graphdef (static), params (nnx.Param), rest (nnx.Variable etc.)
-graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
 @jax.jit
 def compute_grads(params, rest, x, y):
@@ -604,23 +601,48 @@ def eval_forward(params, rest, x, y):
     mdl = nnx.merge(graphdef, params, rest)
     return mdl(x, y, reduction='none')
 
-# ---------------------------------------------------------------------------
-# Gradient extraction helper
-# ---------------------------------------------------------------------------
+def apply_optimizer(param_leaves, grad_leaves, opt_state, lrm, muon_momentum, muon_wd):
+    """Apply AdamW and Muon updates. Runs in Python but ops dispatch to TPU."""
+    new_params = list(param_leaves)
 
-def build_grad_map(params, grads):
-    """
-    Build a mapping from id(param_leaf) -> gradient array.
-    Both params and grads are NNX State objects (nnx.Param filter) with identical structure.
-    The param leaves are the same array objects as model.xxx.value for Param variables.
-    """
-    param_flat = jax.tree.leaves(params)
-    grad_flat = jax.tree.leaves(grads)
-    assert len(param_flat) == len(grad_flat), f"Leaf count mismatch: {len(param_flat)} vs {len(grad_flat)}"
-    grad_map = {}
-    for p_leaf, g_leaf in zip(param_flat, grad_flat):
-        grad_map[id(p_leaf)] = g_leaf
-    return grad_map
+    # --- AdamW updates ---
+    new_ea = list(opt_state['adamw_ea'])
+    new_eas = list(opt_state['adamw_eas'])
+    new_steps = list(opt_state['adamw_steps'])
+    for i, (idx, base_lr, beta1, beta2, eps, wd) in enumerate(adamw_leaf_indices):
+        lr = base_lr * lrm
+        p, ea, eas, sc = adamw_update(
+            new_params[idx], grad_leaves[idx],
+            new_ea[i], new_eas[i], new_steps[i],
+            lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd,
+        )
+        new_params[idx] = p
+        new_ea[i] = ea
+        new_eas[i] = eas
+        new_steps[i] = sc
+
+    # --- Muon updates ---
+    new_mb = list(opt_state['muon_mb'])
+    new_smb = list(opt_state['muon_smb'])
+    for gi, (indices, is_tall, lr_scale, shape) in enumerate(muon_group_info):
+        lr_scaled = MATRIX_LR * lrm * lr_scale
+        stacked_p = jnp.stack([new_params[j] for j in indices])
+        stacked_g = jnp.stack([grad_leaves[j] for j in indices])
+        up, mb, smb = muon_update(
+            stacked_p, stacked_g, new_mb[gi], new_smb[gi],
+            momentum=muon_momentum, lr=lr_scaled, wd=muon_wd,
+            beta2=0.95, is_tall=is_tall,
+        )
+        new_mb[gi] = mb
+        new_smb[gi] = smb
+        for k, j in enumerate(indices):
+            new_params[j] = up[k]
+
+    new_opt_state = {
+        'adamw_ea': new_ea, 'adamw_eas': new_eas, 'adamw_steps': new_steps,
+        'muon_mb': new_mb, 'muon_smb': new_smb,
+    }
+    return new_params, new_opt_state
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -653,61 +675,23 @@ while True:
             )
         total_loss += float(loss) / grad_accum_steps
 
-    # Build gradient map: maps id(param_leaf) -> gradient_array
-    grad_map = build_grad_map(params, accumulated_grads)
+    # Flatten grads to match param_leaves ordering
+    grad_leaves = jax.tree.leaves(accumulated_grads)
 
     # Compute schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
+    muon_wd = get_weight_decay(progress)
 
-    # --- AdamW updates ---
-    for pid, (group_name, var) in param_id_to_group.items():
-        cfg = adamw_config[group_name]
-        lr = cfg['base_lr'] * lrm
-        beta1, beta2 = cfg['betas']
-        # Find gradient for this variable's current value
-        grad_val = grad_map.get(id(var.value))
-        if grad_val is None:
-            continue
-        new_val, new_ea, new_eas, new_step = adamw_update(
-            var.value, grad_val,
-            adamw_states[pid]['exp_avg'],
-            adamw_states[pid]['exp_avg_sq'],
-            adamw_states[pid]['step'],
-            lr=lr, beta1=beta1, beta2=beta2, eps=cfg['eps'], wd=cfg['wd'],
-        )
-        var.value = new_val
-        adamw_states[pid] = {'exp_avg': new_ea, 'exp_avg_sq': new_eas, 'step': new_step}
+    # Apply optimizer (dispatches to TPU, Python overhead is just loop + dispatch)
+    new_param_leaves, opt_state = apply_optimizer(
+        param_leaves, grad_leaves, opt_state, lrm, muon_momentum, muon_wd
+    )
 
-    # --- Muon updates ---
-    for shape, params_list in muon_shape_groups.items():
-        # Flax kernel: (in, out). "tall" = out >= in = shape[-1] >= shape[-2]
-        is_tall = shape[-1] >= shape[-2]
-        # LR scaling: max(1, out/in)^0.5 = max(1, shape[-1]/shape[-2])^0.5
-        lr_scaled = MATRIX_LR * lrm * max(1.0, shape[-1] / shape[-2]) ** 0.5
-
-        stacked_params = jnp.stack([p.value for p in params_list])
-        stacked_grads = jnp.stack([grad_map[id(p.value)] for p in params_list])
-
-        new_params, new_mb, new_smb = muon_update(
-            stacked_params, stacked_grads,
-            muon_states[shape]['momentum_buffer'],
-            muon_states[shape]['second_momentum_buffer'],
-            momentum=muon_momentum,
-            lr=lr_scaled,
-            wd=muon_weight_decay,
-            beta2=0.95,
-            is_tall=is_tall,
-        )
-        muon_states[shape] = {'momentum_buffer': new_mb, 'second_momentum_buffer': new_smb}
-
-        for idx, p in enumerate(params_list):
-            p.value = new_params[idx]
-
-    # Re-split model state after param updates (rest is unchanged)
-    _, params, rest = nnx.split(model, nnx.Param, ...)
+    # Rebuild params pytree from updated leaves
+    params = jax.tree.unflatten(param_treedef, new_param_leaves)
+    param_leaves = new_param_leaves
 
     train_loss_f = total_loss
 
