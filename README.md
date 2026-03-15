@@ -52,10 +52,12 @@ The `program.md` file is essentially a super lightweight "skill".
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py        — constants, data prep + runtime utilities (do not modify)
+train.py          — model, optimizer, training loop for GPU (agent modifies this)
+prepare_jax.py    — JAX-compatible data loading + evaluation for TPU (do not modify)
+train_jax.py      — model, optimizer, training loop for TPU (agent modifies this)
+program.md        — agent instructions
+pyproject.toml    — dependencies
 ```
 
 ## Design choices
@@ -79,6 +81,23 @@ Seeing as there seems to be a lot of interest in tinkering with autoresearch on 
 7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
 
 I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
+
+## TPU Quick Start (v4-8)
+
+**Requirements:** Google Cloud TPU v4-8 (single host, 4 chips), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+
+```bash
+# 1. Install dependencies (JAX/TPU stack)
+uv sync --extra tpu
+
+# 2. Download data and train tokenizer (one-time, ~2 min, CPU-only)
+uv run prepare.py
+
+# 3. Run training on TPU (~5 min)
+uv run train_jax.py
+```
+
+The TPU version uses JAX + Flax NNX with pure data parallelism across all 4 TPU v4 chips. The agent modifies `train_jax.py` (same as `train.py` for GPU). See `program.md` for autonomous experiment loop instructions.
 
 ## Notable forks
 
