@@ -159,6 +159,7 @@ class Block(nnx.Module):
         self.attn = CausalSelfAttention(config, layer_idx, rngs=rngs)
         self.mlp = MLP(config, rngs=rngs)
 
+    @nnx.remat
     def __call__(self, x, ve, cos_sin, mask):
         x = x + self.attn(norm(x), ve, cos_sin, mask)
         x = x + self.mlp(norm(x))
@@ -414,7 +415,7 @@ FINAL_LR_FRAC = 0.0
 
 # Model size
 DEPTH = 8
-DEVICE_BATCH_SIZE = 32  # per-device batch size (TPU v4 has 32GB HBM)
+DEVICE_BATCH_SIZE = 64  # per-device batch size (TPU v4 has 32GB HBM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -604,10 +605,7 @@ def eval_forward(params, rest, x, y):
 
 @jax.jit
 def apply_optimizer(param_tuple, grad_tuple, opt_state, lrm, muon_momentum, muon_wd):
-    """Apply AdamW and Muon updates. Fully JIT-compiled.
-    param_tuple and grad_tuple are tuples of arrays (flattened params/grads).
-    Loops over static Python indices unroll at trace time."""
-    # Start with a mutable mapping of idx -> updated_param
+    """Apply AdamW and Muon updates. Fully JIT-compiled."""
     updates = {}
 
     # --- AdamW updates ---
@@ -631,7 +629,6 @@ def apply_optimizer(param_tuple, grad_tuple, opt_state, lrm, muon_momentum, muon
     new_smb = []
     for gi, (indices, is_tall, lr_scale, shape) in enumerate(muon_group_info):
         lr_scaled = MATRIX_LR * lrm * lr_scale
-        # Use updates dict if param was already modified (shouldn't happen for Muon, but safe)
         stacked_p = jnp.stack([updates.get(j, param_tuple[j]) for j in indices])
         stacked_g = jnp.stack([grad_tuple[j] for j in indices])
         up, mb, smb = muon_update(
@@ -644,9 +641,7 @@ def apply_optimizer(param_tuple, grad_tuple, opt_state, lrm, muon_momentum, muon
         for k, j in enumerate(indices):
             updates[j] = up[k]
 
-    # Build output tuple: use updated value if exists, else original
     out_params = tuple(updates.get(i, param_tuple[i]) for i in range(len(param_tuple)))
-
     new_opt_state = {
         'adamw_ea': new_ea, 'adamw_eas': new_eas, 'adamw_steps': new_steps,
         'muon_mb': new_mb, 'muon_smb': new_smb,
@@ -665,27 +660,13 @@ step = 0
 while True:
     t0 = time.time()
 
-    # Gradient accumulation
-    accumulated_grads = None
-    total_loss = 0.0
+    x_np, y_np, epoch = next(train_loader)
+    x = jax.device_put(x_np, data_sharding)
+    y = jax.device_put(y_np, data_sharding)
 
-    for micro_step in range(grad_accum_steps):
-        x_np, y_np, epoch = next(train_loader)
-        x = jax.device_put(jnp.array(x_np), data_sharding)
-        y = jax.device_put(jnp.array(y_np), data_sharding)
-
-        grads, loss = compute_grads(params, rest, x, y)
-
-        if accumulated_grads is None:
-            accumulated_grads = jax.tree.map(lambda g: g / grad_accum_steps, grads)
-        else:
-            accumulated_grads = jax.tree.map(
-                lambda a, g: a + g / grad_accum_steps, accumulated_grads, grads
-            )
-        total_loss += float(loss) / grad_accum_steps
-
-    # Flatten grads to match param_leaves ordering
-    grad_leaves = tuple(jax.tree.leaves(accumulated_grads))
+    # Forward + backward
+    grads, loss_val = compute_grads(params, rest, x, y)
+    grad_leaves = tuple(jax.tree.leaves(grads))
 
     # Compute schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -693,26 +674,24 @@ while True:
     muon_momentum = get_muon_momentum(step)
     muon_wd = get_weight_decay(progress)
 
-    # Apply optimizer (fully JIT-compiled)
+    # Apply optimizer
     new_param_leaves, opt_state = apply_optimizer(
         param_leaves, grad_leaves, opt_state, lrm, muon_momentum, muon_wd
     )
-
-    # Rebuild params pytree from updated leaves
     param_leaves = new_param_leaves
     params = jax.tree.unflatten(param_treedef, param_leaves)
 
-    train_loss_f = total_loss
+    # Timing (block until step completes)
+    jax.block_until_ready(param_leaves)
+    t1 = time.time()
+    dt = t1 - t0
+
+    train_loss_f = float(loss_val)
 
     # Fast fail
     if math.isnan(train_loss_f) or train_loss_f > 100:
         print("FAIL")
         exit(1)
-
-    # Timing
-    jax.block_until_ready(params)
-    t1 = time.time()
-    dt = t1 - t0
 
     if step > 10:
         total_training_time += dt
